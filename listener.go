@@ -3,101 +3,53 @@ package events
 import (
 	"context"
 	"reflect"
+	"time"
 )
 
 type listener struct {
-	listenerFunc func(context.Context, any) error
-	eventType    reflect.Type
+	id        string
+	eventType reflect.Type
+	handler   HandleFunc
+	retry     *RetryPolicy
 }
 
-func (l *listener) handleEvent(ctx context.Context, event any) error {
-	eventValue := reflect.ValueOf(event)
-	if !eventValue.Type().AssignableTo(l.eventType) {
-		return ErrInvalidEventType
+func (l *listener) execute(ctx context.Context, event Event) error {
+	if l.retry == nil || l.retry.MaxRetries == 0 {
+		return l.handler(ctx, event)
 	}
-
-	return l.listenerFunc(ctx, event)
+	return l.executeWithRetry(ctx, event)
 }
 
-func adapterFromFunction(fn any) (*listener, error) {
-	fnType := reflect.TypeOf(fn)
-	if fnType.NumIn() != 2 || fnType.NumOut() != 1 {
-		return nil, ErrInvalidListenerFunction
-	}
+func (l *listener) executeWithRetry(ctx context.Context, event Event) error {
+	var lastErr error
 
-	ctxType, eventType := fnType.In(0), fnType.In(1)
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
+	delay := l.retry.InitialDelay
 
-	if !ctxType.Implements(contextType) {
-		return nil, ErrInvalidListenerFunction
-	}
-	if fnType.Out(0) != errorType {
-		return nil, ErrInvalidListenerFunction
-	}
+	for attempt := 0; attempt <= l.retry.MaxRetries; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 
-	return &listener{
-		eventType: eventType,
-		listenerFunc: func(ctx context.Context, event any) error {
-			results := reflect.ValueOf(fn).Call([]reflect.Value{
-				reflect.ValueOf(ctx),
-				reflect.ValueOf(event),
-			})
-			if err := results[0].Interface(); err != nil {
-				return err.(error)
-			}
+		lastErr = l.handler(ctx, event)
+		if lastErr == nil {
 			return nil
-		},
-	}, nil
-}
+		}
 
-func listenerFromMethod(receiver reflect.Value, method reflect.Method) (*listener, error) {
-	fnType := method.Type
-	if fnType.NumIn() != 3 {
-		return nil, ErrInvalidListenerMethod
+		if attempt == l.retry.MaxRetries {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+
+		delay = time.Duration(float64(delay) * l.retry.Multiplier)
+		if delay > l.retry.MaxDelay {
+			delay = l.retry.MaxDelay
+		}
 	}
 
-	ctxType := fnType.In(1)
-	eventType := fnType.In(2)
-	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	contextType := reflect.TypeOf((*context.Context)(nil)).Elem()
-
-	if !ctxType.Implements(contextType) {
-		return nil, ErrInvalidListenerMethod
-	}
-	if fnType.NumOut() != 1 || fnType.Out(0) != errorType {
-		return nil, ErrInvalidListenerMethod
-	}
-
-	return &listener{
-		eventType: eventType,
-		listenerFunc: func(ctx context.Context, event any) error {
-			results := method.Func.Call([]reflect.Value{
-				receiver,
-				reflect.ValueOf(ctx),
-				reflect.ValueOf(event),
-			})
-			if err := results[0].Interface(); err != nil {
-				return err.(error)
-			}
-			return nil
-		},
-	}, nil
-}
-
-func newListener(listener any) (*listener, error) {
-	listenerVal := reflect.ValueOf(listener)
-	if !listenerVal.IsValid() {
-		return nil, ErrInvalidListener
-	}
-
-	if listenerVal.Kind() == reflect.Func {
-		return adapterFromFunction(listener)
-	}
-
-	if method, ok := listenerVal.Type().MethodByName("Handle"); ok {
-		return listenerFromMethod(listenerVal, method)
-	}
-
-	return nil, ErrInvalidListener
+	return lastErr
 }

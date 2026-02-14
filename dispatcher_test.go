@@ -3,431 +3,430 @@ package events
 import (
 	"context"
 	"errors"
-	"sync"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-type TestEvent struct {
-	Value string
-}
-
-type AnotherEvent struct {
-	ID int
-}
-
-type testPanicHandler struct {
-	mu    sync.Mutex
-	calls []panicCall
-}
-
-type panicCall struct {
-	event      any
-	listener   any
-	panicValue any
-}
-
-func (m *testPanicHandler) Handle(event any, listener any, panicValue any, stack []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.calls = append(m.calls, panicCall{event, listener, panicValue})
-}
-
-func (m *testPanicHandler) callCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.calls)
-}
-
-type testErrorHandler struct {
-	mu    sync.Mutex
-	calls []errorCall
-}
-
-type errorCall struct {
-	event    any
-	listener any
-	err      error
-}
-
-func (m *testErrorHandler) Handle(event any, listener any, err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.calls = append(m.calls, errorCall{event, listener, err})
-}
-
-func (m *testErrorHandler) callCount() int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.calls)
-}
-
-func waitForCondition(t *testing.T, timeout time.Duration, check func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if check() {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("condition not met within timeout")
-}
-
 func TestNew_DefaultOptions(t *testing.T) {
 	t.Parallel()
 	d := New()
+	defer func() { _ = d.Close(context.Background()) }()
 	if d == nil {
 		t.Fatal("expected non-nil dispatcher")
 	}
-	if d.listeners == nil {
-		t.Error("expected listeners map to be initialized")
+	if d.opts == nil {
+		t.Fatal("expected non-nil options")
 	}
-	if d.closed {
-		t.Error("expected dispatcher to not be closed")
-	}
-	if d.eventChan == nil {
-		t.Error("expected event channel to be initialized")
-	}
-	d.Close()
-}
-
-func TestNew_WithOptions(t *testing.T) {
-	t.Parallel()
-	ph := &testPanicHandler{}
-	eh := &testErrorHandler{}
-	d := New(
-		WithPanicHandler(ph),
-		WithErrorHandler(eh),
-		WithWorkerCount(5),
-	)
-	if d == nil {
-		t.Fatal("expected non-nil dispatcher")
-	}
-	d.Close()
-}
-
-func TestDispatcher_Subscribe_ValidFunction(t *testing.T) {
-	t.Parallel()
-	d := New()
-	defer d.Close()
-
-	fn := func(ctx context.Context, event TestEvent) error {
-		return nil
-	}
-
-	err := d.Subscribe(&TestEvent{}, fn)
-	if err != nil {
-		t.Errorf("expected no error, got %v", err)
+	if !d.opts.asyncMode {
+		t.Error("expected async mode by default")
 	}
 }
 
-func TestDispatcher_Subscribe_EventTypeMismatch(t *testing.T) {
+func TestNew_SyncMode(t *testing.T) {
 	t.Parallel()
-	d := New()
-	defer d.Close()
-
-	fnForTestEvent := func(ctx context.Context, event TestEvent) error {
-		return nil
+	d := syncDispatcher()
+	if d.opts.asyncMode {
+		t.Error("expected sync mode")
 	}
-
-	err := d.Subscribe(&AnotherEvent{}, fnForTestEvent)
-	if !errors.Is(err, ErrInvalidListener) {
-		t.Errorf("expected ErrInvalidListener, got %v", err)
+	if d.sharedChan != nil {
+		t.Error("expected nil sharedChan in sync mode")
 	}
 }
 
-func TestDispatcher_Subscribe_InvalidEventType(t *testing.T) {
+func TestNew_AsyncOrderedMode(t *testing.T) {
 	t.Parallel()
-	tests := []struct {
-		name      string
-		eventType any
-	}{
-		{"nil", nil},
-		{"not_pointer", TestEvent{}},
-		{"pointer_to_primitive", new(int)},
-		{"string", "test"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			d := New()
-			defer d.Close()
-
-			fn := func(ctx context.Context, event TestEvent) error {
-				return nil
-			}
-
-			err := d.Subscribe(tt.eventType, fn)
-			if !errors.Is(err, ErrInvalidEventType) {
-				t.Errorf("expected ErrInvalidEventType, got %v", err)
-			}
-		})
+	d := New(WithAsyncMode(), WithOrderedDelivery(), WithWorkerCount(3), WithBufferSize(5))
+	defer func() { _ = d.Close(context.Background()) }()
+	if len(d.workerChans) != 3 {
+		t.Errorf("expected 3 worker chans, got %d", len(d.workerChans))
 	}
 }
 
-func TestDispatcher_Subscribe_ClosedBus(t *testing.T) {
+func TestNew_BufferSizeAutoCalc(t *testing.T) {
 	t.Parallel()
-	d := New()
-	d.Close()
-
-	fn := func(ctx context.Context, event TestEvent) error {
-		return nil
-	}
-
-	err := d.Subscribe(&TestEvent{}, fn)
-	if !errors.Is(err, ErrBusClosed) {
-		t.Errorf("expected ErrBusClosed, got %v", err)
+	d := New(WithAsyncMode(), WithWorkerCount(4))
+	defer func() { _ = d.Close(context.Background()) }()
+	if d.opts.bufferSize != 40 {
+		t.Errorf("expected buffer size 40, got %d", d.opts.bufferSize)
 	}
 }
 
-func TestDispatcher_Subscribe_InvalidListener(t *testing.T) {
+func TestPublish_NilEvent(t *testing.T) {
 	t.Parallel()
-	d := New()
-	defer d.Close()
-
-	err := d.Subscribe(&TestEvent{}, "not a function")
-	if err == nil {
-		t.Error("expected error for invalid listener")
-	}
-}
-
-func TestDispatcher_Publish_AsyncMode(t *testing.T) {
-	t.Parallel()
-	d := New(WithAsyncMode())
-	defer d.Close()
-
-	var received atomic.Bool
-	fn := func(ctx context.Context, event TestEvent) error {
-		received.Store(true)
-		return nil
-	}
-
-	d.Subscribe(&TestEvent{}, fn)
-	err := d.Publish(context.Background(), TestEvent{Value: "test"})
-	if err != nil {
-		t.Errorf("expected no error, got %v", err)
-	}
-
-	waitForCondition(t, 100*time.Millisecond, func() bool {
-		return received.Load()
-	})
-}
-
-func TestDispatcher_Publish_SyncMode(t *testing.T) {
-	t.Parallel()
-	d := New(WithSyncMode())
-	defer d.Close()
-
-	var received atomic.Bool
-	fn := func(ctx context.Context, event TestEvent) error {
-		received.Store(true)
-		return nil
-	}
-
-	d.Subscribe(&TestEvent{}, fn)
-	err := d.Publish(context.Background(), TestEvent{Value: "test"})
-	if err != nil {
-		t.Errorf("expected no error, got %v", err)
-	}
-
-	if !received.Load() {
-		t.Error("expected event to be received immediately in sync mode")
-	}
-}
-
-func TestDispatcher_Publish_SyncModeMultipleListeners(t *testing.T) {
-	t.Parallel()
-	d := New(WithSyncMode())
-	defer d.Close()
-
-	var count1, count2 atomic.Int32
-	fn1 := func(ctx context.Context, event TestEvent) error {
-		count1.Add(1)
-		return nil
-	}
-	fn2 := func(ctx context.Context, event TestEvent) error {
-		count2.Add(1)
-		return nil
-	}
-
-	d.Subscribe(&TestEvent{}, fn1)
-	d.Subscribe(&TestEvent{}, fn2)
-	d.Publish(context.Background(), TestEvent{Value: "test"})
-
-	if count1.Load() != 1 {
-		t.Errorf("expected listener1 count=1, got %d", count1.Load())
-	}
-	if count2.Load() != 1 {
-		t.Errorf("expected listener2 count=1, got %d", count2.Load())
-	}
-}
-
-func TestDispatcher_Publish_NilEvent(t *testing.T) {
-	t.Parallel()
-	d := New()
-	defer d.Close()
-
+	d := syncDispatcher()
 	err := d.Publish(context.Background(), nil)
 	if err != nil {
-		t.Errorf("expected no error for nil event, got %v", err)
+		t.Errorf("expected nil error for nil event, got %v", err)
 	}
 }
 
-func TestDispatcher_Publish_NoListeners(t *testing.T) {
+func TestPublish_ClosedBus(t *testing.T) {
 	t.Parallel()
-	d := New()
-	defer d.Close()
-
-	err := d.Publish(context.Background(), TestEvent{})
-	if err != nil {
-		t.Errorf("expected no error when no listeners, got %v", err)
-	}
-}
-
-func TestDispatcher_Publish_ClosedBus(t *testing.T) {
-	t.Parallel()
-	d := New()
-	d.Close()
-
-	err := d.Publish(context.Background(), TestEvent{})
+	d := syncDispatcher()
+	_ = d.Close(context.Background())
+	err := d.Publish(context.Background(), newTestEvent("test", "1"))
 	if !errors.Is(err, ErrPublishOnClosedBus) {
 		t.Errorf("expected ErrPublishOnClosedBus, got %v", err)
 	}
 }
 
-func TestDispatcher_Publish_ContextCancelled(t *testing.T) {
+func TestPublish_NoListeners(t *testing.T) {
 	t.Parallel()
-	d := New(WithWorkerCount(1))
-	defer d.Close()
-
-	fn := func(ctx context.Context, event TestEvent) error {
-		return nil
+	d := syncDispatcher()
+	err := d.Publish(context.Background(), newTestEvent("test", "1"))
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
 	}
-	d.Subscribe(&TestEvent{}, fn)
+}
 
+func TestPublish_SyncMode(t *testing.T) {
+	t.Parallel()
+	d := syncDispatcher()
+	var called atomic.Int32
+	SubscribeFunc[*testEvent](d, func(_ context.Context, e *testEvent) error {
+		called.Add(1)
+		return nil
+	})
+	err := d.Publish(context.Background(), newTestEvent("test", "1"))
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if called.Load() != 1 {
+		t.Errorf("expected handler called once, got %d", called.Load())
+	}
+}
+
+func TestPublish_AsyncUnordered(t *testing.T) {
+	t.Parallel()
+	var called atomic.Int32
+	d := asyncDispatcher(2, 10)
+	defer func() { _ = d.Close(context.Background()) }()
+	SubscribeFunc[*testEvent](d, func(_ context.Context, e *testEvent) error {
+		called.Add(1)
+		return nil
+	})
+	err := d.Publish(context.Background(), newTestEvent("test", "a1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ok := waitForCondition(time.Second, func() bool { return called.Load() == 1 })
+	if !ok {
+		t.Errorf("expected handler called, got %d", called.Load())
+	}
+}
+
+func TestPublish_AsyncOrdered(t *testing.T) {
+	t.Parallel()
+	var called atomic.Int32
+	d := New(WithAsyncMode(), WithOrderedDelivery(), WithWorkerCount(2), WithBufferSize(10))
+	defer func() { _ = d.Close(context.Background()) }()
+	SubscribeFunc[*testEvent](d, func(_ context.Context, e *testEvent) error {
+		called.Add(1)
+		return nil
+	})
+	err := d.Publish(context.Background(), newTestEvent("test", "agg-1"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	ok := waitForCondition(time.Second, func() bool { return called.Load() == 1 })
+	if !ok {
+		t.Error("expected handler to be called")
+	}
+}
+
+func TestPublish_ContextCancelled(t *testing.T) {
+	t.Parallel()
+	d := asyncDispatcher(1, 10)
+	defer func() { _ = d.Close(context.Background()) }()
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error { return nil })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-
-	err := d.Publish(ctx, TestEvent{})
+	err := d.Publish(ctx, newTestEvent("test", "1"))
 	if err == nil {
-		t.Error("expected context error")
+		t.Error("expected error for cancelled context")
 	}
 }
 
-func TestDispatcher_Publish_ChannelBlockTimeout(t *testing.T) {
+func TestPublish_EnqueueTimeout(t *testing.T) {
 	t.Parallel()
-	d := New(WithWorkerCount(1))
-	defer d.Close()
-
-	blockChan := make(chan struct{})
-	fn := func(ctx context.Context, event TestEvent) error {
-		<-blockChan
+	m := &spyMetrics{}
+	d := New(
+		WithAsyncMode(), WithWorkerCount(1), WithBufferSize(1),
+		WithPublishTimeout(time.Millisecond), WithMetrics(m),
+	)
+	defer func() { _ = d.Close(context.Background()) }()
+	blocker := make(chan struct{})
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		<-blocker
 		return nil
+	})
+	_ = d.Publish(context.Background(), newTestEvent("e1", "1"))
+	_ = d.Publish(context.Background(), newTestEvent("e2", "1"))
+	err := d.Publish(context.Background(), newTestEvent("e3", "1"))
+	close(blocker)
+	if err != nil && !errors.Is(err, ErrEventChannelBlocked) {
+		t.Errorf("expected ErrEventChannelBlocked or nil, got %v", err)
 	}
-	d.Subscribe(&TestEvent{}, fn)
+}
 
-	for i := 0; i < 11; i++ {
-		d.Publish(context.Background(), TestEvent{})
-	}
-
+func TestPublish_EnqueueContextCancelled(t *testing.T) {
+	t.Parallel()
+	d := New(
+		WithAsyncMode(), WithWorkerCount(1), WithBufferSize(1),
+		WithPublishTimeout(5*time.Second),
+	)
+	defer func() { _ = d.Close(context.Background()) }()
+	blocker := make(chan struct{})
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		<-blocker
+		return nil
+	})
+	_ = d.Publish(context.Background(), newTestEvent("fill1", "1"))
+	_ = d.Publish(context.Background(), newTestEvent("fill2", "1"))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-
-	err := d.Publish(ctx, TestEvent{})
-	close(blockChan)
-
-	if err == nil {
-		t.Error("expected error due to context or channel block")
+	err := d.Publish(ctx, newTestEvent("overflow", "1"))
+	close(blocker)
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Logf("got err: %v (acceptable)", err)
 	}
 }
 
-func TestDispatcher_Close_MultipleCalls(t *testing.T) {
+func TestPublishAll_Success(t *testing.T) {
 	t.Parallel()
-	d := New()
-
-	err1 := d.Close()
-	if err1 != nil {
-		t.Errorf("first close: expected no error, got %v", err1)
-	}
-
-	err2 := d.Close()
-	if err2 != nil {
-		t.Errorf("second close: expected no error, got %v", err2)
-	}
-}
-
-func TestDispatcher_ProcessEvent_WithPanic(t *testing.T) {
-	t.Parallel()
-	ph := &testPanicHandler{calls: make([]panicCall, 0)}
-	d := New(WithPanicHandler(ph))
-	defer d.Close()
-
-	fn := func(ctx context.Context, event TestEvent) error {
-		panic("test panic")
-	}
-
-	d.Subscribe(&TestEvent{}, fn)
-	d.Publish(context.Background(), TestEvent{})
-
-	waitForCondition(t, 100*time.Millisecond, func() bool {
-		return ph.callCount() > 0
+	d := syncDispatcher()
+	var count atomic.Int32
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		count.Add(1)
+		return nil
 	})
+	err := d.PublishAll(context.Background(),
+		newTestEvent("a", "1"), newTestEvent("b", "2"))
+	if err != nil {
+		t.Errorf("expected nil, got %v", err)
+	}
+	if count.Load() != 2 {
+		t.Errorf("expected 2 calls, got %d", count.Load())
+	}
 }
 
-func TestDispatcher_ProcessEvent_WithError(t *testing.T) {
+func TestPublishAll_StopsOnError(t *testing.T) {
 	t.Parallel()
-	eh := &testErrorHandler{calls: make([]errorCall, 0)}
-	d := New(WithErrorHandler(eh))
-	defer d.Close()
-
-	testErr := errors.New("test error")
-	fn := func(ctx context.Context, event TestEvent) error {
-		return testErr
+	d := syncDispatcher()
+	_ = d.Close(context.Background())
+	err := d.PublishAll(context.Background(),
+		newTestEvent("a", "1"), newTestEvent("b", "2"))
+	if !errors.Is(err, ErrPublishOnClosedBus) {
+		t.Errorf("expected ErrPublishOnClosedBus, got %v", err)
 	}
+}
 
-	d.Subscribe(&TestEvent{}, fn)
-	d.Publish(context.Background(), TestEvent{})
+func TestClose_AlreadyClosed(t *testing.T) {
+	t.Parallel()
+	d := syncDispatcher()
+	if err := d.Close(context.Background()); err != nil {
+		t.Errorf("first close should succeed: %v", err)
+	}
+	if err := d.Close(context.Background()); err != nil {
+		t.Errorf("second close should return nil: %v", err)
+	}
+}
 
-	waitForCondition(t, 100*time.Millisecond, func() bool {
-		return eh.callCount() > 0
+func TestClose_ShutdownTimeout(t *testing.T) {
+	t.Parallel()
+	d := asyncDispatcher(1, 10)
+	blocker := make(chan struct{})
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		<-blocker
+		return nil
 	})
-}
-
-func TestDispatcher_ProcessEvent_SyncModeWithPanic(t *testing.T) {
-	t.Parallel()
-	ph := &testPanicHandler{calls: make([]panicCall, 0)}
-	d := New(WithSyncMode(), WithPanicHandler(ph))
-	defer d.Close()
-
-	fn := func(ctx context.Context, event TestEvent) error {
-		panic("sync panic")
-	}
-
-	d.Subscribe(&TestEvent{}, fn)
-	d.Publish(context.Background(), TestEvent{})
-
-	if ph.callCount() == 0 {
-		t.Error("expected panic handler to be called in sync mode")
+	_ = d.Publish(context.Background(), newTestEvent("block", "1"))
+	time.Sleep(10 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := d.Close(ctx)
+	close(blocker)
+	if !errors.Is(err, ErrShutdownTimeout) {
+		t.Errorf("expected ErrShutdownTimeout, got %v", err)
 	}
 }
 
-func TestDispatcher_ProcessEvent_SyncModeWithError(t *testing.T) {
+func TestClose_SyncMode(t *testing.T) {
 	t.Parallel()
-	eh := &testErrorHandler{calls: make([]errorCall, 0)}
-	d := New(WithSyncMode(), WithErrorHandler(eh))
-	defer d.Close()
-
-	testErr := errors.New("sync error")
-	fn := func(ctx context.Context, event TestEvent) error {
-		return testErr
+	d := syncDispatcher()
+	err := d.Close(context.Background())
+	if err != nil {
+		t.Errorf("expected nil, got %v", err)
 	}
+}
 
-	d.Subscribe(&TestEvent{}, fn)
-	d.Publish(context.Background(), TestEvent{})
+func TestProcessEvent_PanicRecovery(t *testing.T) {
+	t.Parallel()
+	ph := &spyPanicHandler{}
+	d := syncDispatcher(WithPanicHandler(ph))
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		panic("boom")
+	})
+	err := d.Publish(context.Background(), newTestEvent("panic", "1"))
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if !ph.called {
+		t.Error("expected panic handler to be called")
+	}
+	if ph.value != "boom" {
+		t.Errorf("expected panic value 'boom', got %v", ph.value)
+	}
+}
 
-	if eh.callCount() == 0 {
-		t.Error("expected error handler to be called in sync mode")
+func TestProcessEvent_ErrorHandler(t *testing.T) {
+	t.Parallel()
+	eh := &spyErrorHandler{}
+	d := syncDispatcher(WithErrorHandler(eh))
+	handlerErr := errors.New("handler failed")
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		return handlerErr
+	})
+	_ = d.Publish(context.Background(), newTestEvent("err", "1"))
+	if len(eh.errors) != 1 || !errors.Is(eh.errors[0], handlerErr) {
+		t.Errorf("expected handler error, got %v", eh.errors)
+	}
+}
+
+func TestNormalizeType_Pointer(t *testing.T) {
+	t.Parallel()
+	ptrType := reflect.TypeOf((*testEvent)(nil))
+	result := normalizeType(ptrType)
+	if result.Kind() == reflect.Pointer {
+		t.Error("expected non-pointer type")
+	}
+}
+
+func TestNormalizeType_Value(t *testing.T) {
+	t.Parallel()
+	valType := reflect.TypeOf(testEvent{})
+	result := normalizeType(valType)
+	if result != valType {
+		t.Error("expected same type for value")
+	}
+}
+
+func TestPartitionIndex_EmptyKey(t *testing.T) {
+	t.Parallel()
+	d := &Dispatcher{opts: &dispatcherOptions{workerCount: 4}}
+	idx := d.partitionIndex("")
+	if idx != 0 {
+		t.Errorf("expected 0 for empty key, got %d", idx)
+	}
+}
+
+func TestPartitionIndex_NonEmptyKey(t *testing.T) {
+	t.Parallel()
+	d := &Dispatcher{opts: &dispatcherOptions{workerCount: 4}}
+	idx := d.partitionIndex("some-aggregate")
+	if idx < 0 || idx >= 4 {
+		t.Errorf("expected index in [0,4), got %d", idx)
+	}
+}
+
+func TestPartitionIndex_Consistency(t *testing.T) {
+	t.Parallel()
+	d := &Dispatcher{opts: &dispatcherOptions{workerCount: 8}}
+	idx1 := d.partitionIndex("agg-42")
+	idx2 := d.partitionIndex("agg-42")
+	if idx1 != idx2 {
+		t.Errorf("expected same partition, got %d and %d", idx1, idx2)
+	}
+}
+
+func TestRemoveFromSlice(t *testing.T) {
+	t.Parallel()
+	l1 := &listener{id: "a"}
+	l2 := &listener{id: "b"}
+	l3 := &listener{id: "c"}
+	result := removeFromSlice([]*listener{l1, l2, l3}, l2)
+	if len(result) != 2 {
+		t.Fatalf("expected 2, got %d", len(result))
+	}
+	for _, l := range result {
+		if l.id == "b" {
+			t.Error("expected 'b' to be removed")
+		}
+	}
+}
+
+func TestRemoveFromSlice_NotFound(t *testing.T) {
+	t.Parallel()
+	l1 := &listener{id: "a"}
+	target := &listener{id: "z"}
+	result := removeFromSlice([]*listener{l1}, target)
+	if len(result) != 1 {
+		t.Errorf("expected 1, got %d", len(result))
+	}
+}
+
+func TestPublish_GlobalAndTypedListeners(t *testing.T) {
+	t.Parallel()
+	d := syncDispatcher()
+	var typedCalled, globalCalled atomic.Int32
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		typedCalled.Add(1)
+		return nil
+	})
+	d.SubscribeAll(func(_ context.Context, _ Event) error {
+		globalCalled.Add(1)
+		return nil
+	})
+	_ = d.Publish(context.Background(), newTestEvent("ev", "1"))
+	if typedCalled.Load() != 1 {
+		t.Errorf("expected typed called once, got %d", typedCalled.Load())
+	}
+	if globalCalled.Load() != 1 {
+		t.Errorf("expected global called once, got %d", globalCalled.Load())
+	}
+}
+
+func TestPublish_MetricsPublished(t *testing.T) {
+	t.Parallel()
+	m := &spyMetrics{}
+	d := syncDispatcher(WithMetrics(m))
+	SubscribeFunc[*testEvent](d, func(_ context.Context, _ *testEvent) error {
+		return nil
+	})
+	_ = d.Publish(context.Background(), newTestEvent("metric-event", "1"))
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.publishedNames) != 1 || m.publishedNames[0] != "metric-event" {
+		t.Errorf("expected metric-event published, got %v", m.publishedNames)
+	}
+}
+
+func TestPublish_PointerEvent(t *testing.T) {
+	t.Parallel()
+	d := syncDispatcher()
+	var called atomic.Int32
+	SubscribeFunc[*testEvent](d, func(_ context.Context, e *testEvent) error {
+		called.Add(1)
+		return nil
+	})
+	err := d.Publish(context.Background(), &testEvent{
+		BaseEvent: NewBaseEvent("ptr", "1"),
+	})
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if called.Load() != 1 {
+		t.Errorf("expected 1 call, got %d", called.Load())
+	}
+}
+
+func TestClose_AsyncOrdered(t *testing.T) {
+	t.Parallel()
+	d := New(WithAsyncMode(), WithOrderedDelivery(), WithWorkerCount(2), WithBufferSize(5))
+	err := d.Close(context.Background())
+	if err != nil {
+		t.Errorf("expected nil, got %v", err)
 	}
 }

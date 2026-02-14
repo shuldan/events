@@ -2,33 +2,31 @@ package events
 
 import "log/slog"
 
-type defaultPanicHandler struct{}
-
-func newDefaultPanicHandler() PanicHandler {
-	return &defaultPanicHandler{}
+type PanicHandler interface {
+	Handle(event Event, panicValue any, stack []byte)
 }
 
-func (d *defaultPanicHandler) Handle(event any, listener any, panicValue any, stack []byte) {
-	slog.Error(
-		"event eventBus panic",
-		"event", event,
-		"listener", listener,
-		"panic_value", panicValue,
+type ErrorHandler interface {
+	Handle(event Event, err error)
+}
+
+type defaultPanicHandler struct{}
+
+func (d *defaultPanicHandler) Handle(event Event, panicValue any, stack []byte) {
+	slog.Error("event bus panic",
+		"event", event.EventName(),
+		"aggregate_id", event.AggregateID(),
+		"panic", panicValue,
 		"stack", string(stack),
 	)
 }
 
 type defaultErrorHandler struct{}
 
-func newDefaultErrorHandler() ErrorHandler {
-	return &defaultErrorHandler{}
-}
-
-func (d *defaultErrorHandler) Handle(event any, listener any, err error) {
-	slog.Error(
-		"event eventBus error",
-		"event", event,
-		"listener", listener,
+func (d *defaultErrorHandler) Handle(event Event, err error) {
+	slog.Error("event bus handler error",
+		"event", event.EventName(),
+		"aggregate_id", event.AggregateID(),
 		"error", err,
 	)
 }
