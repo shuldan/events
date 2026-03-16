@@ -4,23 +4,23 @@
 [![codecov](https://codecov.io/gh/shuldan/events/branch/main/graph/badge.svg)](https://codecov.io/gh/shuldan/events)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Пакет `events` предоставляет высокопроизводительную шину доменных событий для Go-приложений, построенных по принципам DDD. Использует дженерики для типобезопасности на этапе компиляции, поддерживает синхронную и асинхронную доставку, middleware, retry-политики и упорядоченную обработку.
+Пакет `events` предоставляет высокопроизводительную шину доменных событий для Go-приложений, построенных по принципам DDD. Использует дженерики для типобезопасности на этапе компиляции, поддерживает синхронную и асинхронную доставку, структурные middleware, retry-политики, упорядоченную обработку по ключу и абстрактный транспорт для кросс-сервисного взаимодействия.
 
 ---
 
 ## Основные возможности
 
-- **Типобезопасность через дженерики** — ошибки несоответствия типов обнаруживаются на этапе компиляции, а не в рантайме.
-- **Структурные и функциональные обработчики** — слушателем может быть структура с методом `Handle` или обычная функция.
-- **Middleware** — цепочки сквозной логики: логирование, трассировка, метрики, транзакции.
-- **Retry с exponential backoff** — настраиваемая политика повторных попыток для каждой подписки.
-- **Упорядоченная доставка** — события одного агрегата обрабатываются последовательно через партиционирование по `AggregateID`.
-- **Wildcard-подписки** — глобальные обработчики, получающие все события (аудит, логирование).
-- **Batch-публикация** — отправка нескольких событий за один вызов.
+- **Типобезопасность через дженерики** — ошибки несоответствия типов обнаруживаются на этапе компиляции.
+- **Структурные обработчики** — слушателем является структура, реализующая интерфейс `Handler[E]`.
+- **Структурные middleware** — цепочки сквозной логики через интерфейс `Middleware` с методом `Wrap`.
+- **Retry с exponential backoff** — настраиваемая политика повторных попыток глобально и для каждой подписки.
+- **Упорядоченная доставка по ключу** — события с одинаковым `EventKey()` обрабатываются последовательно.
+- **Batch-публикация** — отправка нескольких событий за один вызов `PublishAll`.
 - **Отписка** — каждая подписка возвращает объект `Subscription` для управления жизненным циклом.
 - **Graceful shutdown** — корректное завершение с поддержкой таймаута через контекст.
-- **Observability** — интерфейс `MetricsCollector` для сбора метрик обработки.
-- **Тестируемость** — интерфейсы `Publisher`, `Subscriber`, `EventBus` для подмены в тестах.
+- **Абстрактный транспорт** — интерфейс `Transport` для кросс-сервисной доставки (Kafka, NATS, RabbitMQ).
+- **Абстрактный кодек** — интерфейс `Codec` для сериализации событий (JSON, Protobuf).
+- **Нулевые внешние зависимости в ядре** — корневой пакет зависит только от стандартной библиотеки.
 
 ---
 
@@ -49,30 +49,34 @@ import (
 
 // Определяем доменное событие.
 type OrderCreated struct {
-    events.BaseEvent
     OrderID string
     UserID  string
     Amount  float64
 }
 
-func main() {
-    // Создаём шину в синхронном режиме.
-    bus := events.New(events.WithSyncMode())
-    defer bus.Close(context.Background())
+// Определяем обработчик.
+type OrderCreatedListener struct{}
 
-    // Подписываемся функцией.
-    events.SubscribeFunc(bus, func(ctx context.Context, e OrderCreated) error {
-        fmt.Printf("Order %s created for user %s, amount: %.2f\n",
-            e.OrderID, e.UserID, e.Amount)
-        return nil
-    })
+func (l *OrderCreatedListener) Handle(ctx context.Context, e OrderCreated) error {
+    fmt.Printf("Order %s created for user %s, amount: %.2f\n",
+        e.OrderID, e.UserID, e.Amount)
+    return nil
+}
+
+func main() {
+    // Создаём диспетчер в синхронном режиме (по умолчанию).
+    d := events.New()
+    defer d.Close(context.Background())
+
+    // Подписываемся.
+    listener := &OrderCreatedListener{}
+    events.Subscribe(d, listener)
 
     // Публикуем событие.
-    err := bus.Publish(context.Background(), OrderCreated{
-        BaseEvent: events.NewBaseEvent("order.created", "order-1"),
-        OrderID:   "order-1",
-        UserID:    "user-42",
-        Amount:    199.90,
+    err := d.Publish(context.Background(), OrderCreated{
+        OrderID: "order-1",
+        UserID:  "user-42",
+        Amount:  199.90,
     })
     if err != nil {
         log.Fatal(err)
@@ -84,28 +88,16 @@ func main() {
 
 ## Определение событий
 
-Каждое событие реализует интерфейс `Event`. Для удобства предусмотрена базовая структура `BaseEvent`, которую достаточно встроить.
-
-```go
-type Event interface {
-    EventName() string
-    OccurredAt() time.Time
-    AggregateID() string
-}
-```
-
-### Пример доменных событий
+Событием может быть любая структура — специальный интерфейс реализовывать не нужно.
 
 ```go
 type OrderShipped struct {
-    events.BaseEvent
     OrderID    string
     TrackingNo string
     ShippedAt  time.Time
 }
 
 type PaymentReceived struct {
-    events.BaseEvent
     PaymentID string
     OrderID   string
     Amount    float64
@@ -113,28 +105,39 @@ type PaymentReceived struct {
 }
 ```
 
-`NewBaseEvent` автоматически генерирует уникальный ID и устанавливает время:
+### Упорядоченные события
+
+Для гарантии порядка обработки реализуйте интерфейс `KeyedEvent`:
 
 ```go
-evt := OrderShipped{
-    BaseEvent:  events.NewBaseEvent("order.shipped", "order-123"),
-    OrderID:    "order-123",
-    TrackingNo: "TRACK-456",
-    ShippedAt:  time.Now(),
+type KeyedEvent interface {
+    EventKey() string
+}
+```
+
+```go
+type OrderStatusChanged struct {
+    OrderID   string
+    NewStatus string
 }
 
-evt.EventName()    // "order.shipped"
-evt.AggregateID()  // "order-123"
-evt.OccurredAt()   // time.Time (момент создания)
+// События одного заказа обрабатываются последовательно.
+func (e OrderStatusChanged) EventKey() string { return e.OrderID }
 ```
 
 ---
 
 ## Обработчики событий
 
-### Структурный обработчик
+Обработчик — это структура, реализующая интерфейс `Handler[E]`:
 
-Основной способ для обработчиков с зависимостями. Любая структура с методом `Handle(context.Context, T) error` автоматически реализует интерфейс `Handler[T]`.
+```go
+type Handler[E Event] interface {
+    Handle(ctx context.Context, event E) error
+}
+```
+
+### Пример
 
 ```go
 type ShippingNotificationListener struct {
@@ -164,36 +167,7 @@ func (l *ShippingNotificationListener) Handle(ctx context.Context, e OrderShippe
 
 ```go
 listener := NewShippingNotificationListener(mailer, "shipping-tpl")
-sub := events.Subscribe(bus, listener)
-```
-
-### Функциональный обработчик
-
-Для простых случаев, не требующих зависимостей:
-
-```go
-sub := events.SubscribeFunc(bus, func(ctx context.Context, e PaymentReceived) error {
-    slog.InfoContext(ctx, "payment received",
-        "payment_id", e.PaymentID,
-        "amount", e.Amount,
-    )
-    return nil
-})
-```
-
-### Wildcard-обработчик
-
-Получает все события независимо от типа. Удобен для аудита и сквозного логирования:
-
-```go
-bus.SubscribeAll(func(ctx context.Context, e events.Event) error {
-    slog.InfoContext(ctx, "event occurred",
-        "name", e.EventName(),
-        "aggregate_id", e.AggregateID(),
-        "occurred_at", e.OccurredAt(),
-    )
-    return nil
-})
+sub := events.Subscribe(d, listener)
 ```
 
 ---
@@ -203,7 +177,7 @@ bus.SubscribeAll(func(ctx context.Context, e events.Event) error {
 Каждая функция подписки возвращает объект `Subscription`:
 
 ```go
-sub := events.Subscribe(bus, listener)
+sub := events.Subscribe(d, listener)
 
 // Обработчик больше не будет вызываться.
 sub.Unsubscribe()
@@ -216,8 +190,7 @@ sub.Unsubscribe()
 ### Одиночная публикация
 
 ```go
-err := bus.Publish(ctx, OrderShipped{
-    BaseEvent:  events.NewBaseEvent("order.shipped", "order-123"),
+err := d.Publish(ctx, OrderShipped{
     OrderID:    "order-123",
     TrackingNo: "TRACK-789",
     ShippedAt:  time.Now(),
@@ -226,22 +199,23 @@ err := bus.Publish(ctx, OrderShipped{
 
 ### Batch-публикация
 
-Публикация нескольких событий за один вызов:
-
 ```go
-err := bus.PublishAll(ctx,
-    OrderShipped{
-        BaseEvent: events.NewBaseEvent("order.shipped", "order-1"),
-        OrderID:   "order-1",
-    },
-    PaymentReceived{
-        BaseEvent: events.NewBaseEvent("payment.received", "order-1"),
-        PaymentID: "pay-1",
-        OrderID:   "order-1",
-        Amount:    99.90,
-    },
+err := d.PublishAll(ctx,
+    OrderShipped{OrderID: "order-1", TrackingNo: "TRACK-001"},
+    PaymentReceived{PaymentID: "pay-1", OrderID: "order-1", Amount: 99.90},
 )
 ```
+
+### Поведение при ошибках
+
+Обработчики независимы друг от друга. Событие доставляется всем подписчикам, даже если один из них вернул ошибку:
+
+| Сценарий | Sync | Async |
+|---|---|---|
+| Handler A — ok, Handler B — error | Оба вызваны, `errors.Join(nil, errB)` | Оба вызваны, `ErrorHandler(errB)` |
+| Handler A — error, Handler B — ok | Оба вызваны, `errors.Join(errA, nil)` | Оба вызваны, `ErrorHandler(errA)` |
+| Retry исчерпан | Ошибка в `errors.Join` | `ErrorHandler` |
+| Dispatcher закрыт | `ErrDispatcherClosed` | `ErrDispatcherClosed` |
 
 ---
 
@@ -250,121 +224,156 @@ err := bus.PublishAll(ctx,
 ### Создание диспетчера
 
 ```go
-bus := events.New(
-    events.WithAsyncMode(),           // асинхронная обработка (по умолчанию)
-    events.WithWorkerCount(8),        // количество воркеров (по умолчанию runtime.NumCPU())
-    events.WithBufferSize(100),       // размер буфера канала (по умолчанию workerCount * 10)
-    events.WithPublishTimeout(3*time.Second), // таймаут отправки в канал (по умолчанию 5s)
-    events.WithOrderedDelivery(),     // упорядоченная доставка по AggregateID
-    events.WithMiddleware(mw1, mw2), // глобальные middleware
-    events.WithPanicHandler(ph),      // кастомный обработчик паник
-    events.WithErrorHandler(eh),      // кастомный обработчик ошибок
-    events.WithMetrics(collector),    // сборщик метрик
+d := events.New(
+    events.WithAsyncMode(),
+    events.WithWorkerPool(8),
+    events.WithErrorHandler(func(ctx context.Context, event events.Event, err error) {
+        slog.Error("event handling failed", "error", err)
+    }),
+    events.WithMiddleware(
+        middleware.NewLogging(slog.Default()),
+    ),
+    events.WithCodec(codec.NewJSON()),
+    events.WithTransport(kafka.New(kafka.Config{
+        Brokers: []string{"localhost:9092"},
+        Topic:   "domain-events",
+    })),
+    events.WithDefaultSubscribeOptions(
+        events.WithRetry(events.RetryPolicy{
+            MaxRetries:   3,
+            InitialDelay: 100 * time.Millisecond,
+            MaxDelay:     2 * time.Second,
+            Multiplier:   2.0,
+        }),
+        events.WithTimeout(30 * time.Second),
+    ),
 )
+defer d.Close(context.Background())
 ```
 
 ### Режимы доставки
 
-**Синхронный** — события обрабатываются немедленно в горутине вызывающего `Publish`. Гарантирует порядок. Воркеры не создаются:
+**Синхронный** (по умолчанию) — события обрабатываются в горутине вызывающего `Publish`:
 
 ```go
-bus := events.New(events.WithSyncMode())
+d := events.New()
 ```
 
-**Асинхронный** — события помещаются в буферизованный канал и обрабатываются пулом воркеров:
+**Асинхронный** — события обрабатываются пулом воркеров:
 
 ```go
-bus := events.New(events.WithAsyncMode(), events.WithWorkerCount(4))
+d := events.New(events.WithAsyncMode(), events.WithWorkerPool(4))
 ```
 
-### Упорядоченная доставка
+### Упорядоченная доставка по ключу
 
-При включённом `WithOrderedDelivery()` события с одинаковым `AggregateID` всегда попадают на один и тот же воркер. Это гарантирует последовательную обработку событий внутри агрегата:
+События, реализующие `KeyedEvent`, с одинаковым ключом всегда обрабатываются последовательно. Разные ключи обрабатываются параллельно:
 
 ```go
-bus := events.New(
-    events.WithAsyncMode(),
-    events.WithOrderedDelivery(),
-    events.WithWorkerCount(8),
-)
+type OrderStatusChanged struct {
+    OrderID   string
+    NewStatus string
+}
+
+func (e OrderStatusChanged) EventKey() string { return e.OrderID }
+
+// Все события заказа "order-123" обрабатываются последовательно,
+// события "order-456" — параллельно с ними.
 ```
 
 ---
 
 ## Middleware
 
-Middleware позволяет добавлять сквозную логику вокруг обработки событий. Применяются в порядке добавления: первый — внешний (выполняется первым до обработчика и последним после).
+Middleware реализуется через структурный интерфейс:
 
 ```go
-type Middleware func(next HandleFunc) HandleFunc
+type Next interface {
+    Handle(ctx context.Context, event Event) error
+}
+
+type Middleware interface {
+    Wrap(next Next) Next
+}
+```
+
+### Порядок применения
+
+```
+Global Middleware 1
+  → Global Middleware 2
+    → Subscribe Middleware 1
+      → [Timeout]
+        → [Retry]
+          → Handler.Handle()
 ```
 
 ### Пример: логирование
 
 ```go
-func LoggingMiddleware() events.Middleware {
-    return func(next events.HandleFunc) events.HandleFunc {
-        return func(ctx context.Context, event events.Event) error {
-            slog.InfoContext(ctx, "event handling started",
-                "event", event.EventName(),
-                "aggregate_id", event.AggregateID(),
-            )
+type loggingMiddleware struct {
+    logger *slog.Logger
+}
 
-            start := time.Now()
-            err := next(ctx, event)
-            duration := time.Since(start)
+func NewLogging(logger *slog.Logger) events.Middleware {
+    return &loggingMiddleware{logger: logger}
+}
 
-            if err != nil {
-                slog.ErrorContext(ctx, "event handling failed",
-                    "event", event.EventName(),
-                    "duration", duration,
-                    "error", err,
-                )
-            } else {
-                slog.InfoContext(ctx, "event handling completed",
-                    "event", event.EventName(),
-                    "duration", duration,
-                )
-            }
+func (m *loggingMiddleware) Wrap(next events.Next) events.Next {
+    return &loggingNext{logger: m.logger, next: next}
+}
 
-            return err
-        }
+type loggingNext struct {
+    logger *slog.Logger
+    next   events.Next
+}
+
+func (n *loggingNext) Handle(ctx context.Context, event events.Event) error {
+    n.logger.Info("handling event", "type", fmt.Sprintf("%T", event))
+    start := time.Now()
+
+    err := n.next.Handle(ctx, event)
+
+    if err != nil {
+        n.logger.Error("event failed", "duration", time.Since(start), "error", err)
+    } else {
+        n.logger.Info("event handled", "duration", time.Since(start))
     }
+    return err
 }
 ```
 
-### Пример: трассировка
+### Готовые middleware
+
+Пакет `events/middleware` предоставляет готовые реализации:
 
 ```go
-func TracingMiddleware(tracer trace.Tracer) events.Middleware {
-    return func(next events.HandleFunc) events.HandleFunc {
-        return func(ctx context.Context, event events.Event) error {
-            ctx, span := tracer.Start(ctx, "event:"+event.EventName(),
-                trace.WithAttributes(
-                    attribute.String("event.aggregate_id", event.AggregateID()),
-                ),
-            )
-            defer span.End()
+import "github.com/shuldan/events/middleware"
 
-            err := next(ctx, event)
-            if err != nil {
-                span.RecordError(err)
-                span.SetStatus(codes.Error, err.Error())
-            }
-            return err
-        }
-    }
-}
+d := events.New(
+    events.WithMiddleware(
+        middleware.NewLogging(slog.Default()),
+        middleware.NewMetrics(recorder),
+    ),
+)
+
+// Recovery не включён по умолчанию — подключается осознанно:
+events.Subscribe(d, handler,
+    events.WithSubscribeMiddleware(middleware.NewRecovery()),
+)
 ```
 
 ### Применение
 
+Middleware можно задать глобально и на уровне подписки. Локальные дополняют глобальные:
+
 ```go
-bus := events.New(
-    events.WithMiddleware(
-        LoggingMiddleware(),
-        TracingMiddleware(tracer),
-    ),
+d := events.New(
+    events.WithMiddleware(globalMw),
+)
+
+events.Subscribe(d, handler,
+    events.WithSubscribeMiddleware(localMw),
 )
 ```
 
@@ -372,15 +381,31 @@ bus := events.New(
 
 ## Retry-политика
 
-Политика повторных попыток задаётся при подписке и применяется индивидуально к каждому обработчику:
+Задаётся глобально или на уровне подписки. Локальные переопределяют глобальные:
 
 ```go
-events.Subscribe(bus, listener, events.WithRetry(events.RetryPolicy{
-    MaxRetries:   5,              // максимальное число повторов
-    InitialDelay: 100 * time.Millisecond, // начальная задержка
-    MaxDelay:     5 * time.Second,        // максимальная задержка
-    Multiplier:   2.0,                    // множитель (exponential backoff)
-}))
+// Глобальный дефолт.
+d := events.New(
+    events.WithDefaultSubscribeOptions(
+        events.WithRetry(events.RetryPolicy{
+            MaxRetries:   3,
+            InitialDelay: 100 * time.Millisecond,
+            MaxDelay:     2 * time.Second,
+            Multiplier:   2.0,
+        }),
+    ),
+)
+
+// Переопределение для критичного обработчика.
+events.Subscribe(d, paymentHandler,
+    events.WithRetry(events.RetryPolicy{
+        MaxRetries:   10,
+        InitialDelay: 500 * time.Millisecond,
+        MaxDelay:     30 * time.Second,
+        Multiplier:   2.0,
+    }),
+    events.WithTimeout(60 * time.Second),
+)
 ```
 
 Логика:
@@ -392,91 +417,76 @@ events.Subscribe(bus, listener, events.WithRetry(events.RetryPolicy{
 
 ---
 
-## Обработка ошибок и паник
+## Транспорт
 
-### Ошибки обработчиков
-
-После исчерпания retry-попыток (или при отсутствии retry) ошибка передаётся в `ErrorHandler`:
+Интерфейс `Transport` позволяет доставлять события между сервисами:
 
 ```go
-type ErrorHandler interface {
-    Handle(event Event, err error)
+type Transport interface {
+    Publish(ctx context.Context, envelope Envelope) error
+    Subscribe(ctx context.Context, handler TransportHandler) error
+    Close(ctx context.Context) error
+}
+
+type TransportHandler interface {
+    Handle(ctx context.Context, envelope Envelope) error
 }
 ```
 
-```go
-type alertingErrorHandler struct {
-    alerter AlertService
-}
+### Поток данных
 
-func (h *alertingErrorHandler) Handle(event events.Event, err error) {
-    slog.Error("event handler failed",
-        "event", event.EventName(),
-        "aggregate_id", event.AggregateID(),
-        "error", err,
-    )
-    h.alerter.Send(fmt.Sprintf("Event %s failed: %v", event.EventName(), err))
-}
+```
+Service A:
+  Publish(Event)
+      │
+      ├──► local handlers
+      │
+      ├──► Codec.Encode(Event) → []byte
+      │        │
+      └────────┴──► Transport.Publish(Envelope) ──► Kafka / NATS / RabbitMQ
 
-bus := events.New(events.WithErrorHandler(&alertingErrorHandler{alerter: alerter}))
+Service B:
+  Kafka ──► Transport.Subscribe() → Envelope
+                │
+                ▼
+            Codec.Decode([]byte) → Event
+                │
+                ▼
+            local handlers
 ```
 
-### Паники
+### Кодек
 
-Паники в обработчиках перехватываются автоматически и передаются в `PanicHandler`:
-
-```go
-type PanicHandler interface {
-    Handle(event Event, panicValue any, stack []byte)
-}
-```
-
----
-
-## Observability
-
-Интерфейс `MetricsCollector` позволяет собирать метрики обработки:
+Интерфейс `Codec` отделяет сериализацию от транспорта:
 
 ```go
-type MetricsCollector interface {
-    EventPublished(eventName string)
-    EventHandled(eventName string, duration time.Duration, err error)
-    EventDropped(eventName string, reason string)
-    QueueDepth(depth int)
+type Codec interface {
+    Encode(event Event) ([]byte, error)
+    Decode(data []byte, target Event) error
+    ContentType() string
 }
 ```
 
-### Пример: интеграция с Prometheus
+Готовая реализация:
 
 ```go
-type prometheusMetrics struct {
-    published  *prometheus.CounterVec
-    handled    *prometheus.HistogramVec
-    errors     *prometheus.CounterVec
-    dropped    *prometheus.CounterVec
-    queueDepth prometheus.Gauge
-}
+import "github.com/shuldan/events/codec"
 
-func (m *prometheusMetrics) EventPublished(name string) {
-    m.published.WithLabelValues(name).Inc()
-}
+d := events.New(
+    events.WithCodec(codec.NewJSON()),
+)
+```
 
-func (m *prometheusMetrics) EventHandled(name string, duration time.Duration, err error) {
-    m.handled.WithLabelValues(name).Observe(duration.Seconds())
-    if err != nil {
-        m.errors.WithLabelValues(name).Inc()
-    }
-}
+### Готовые транспорты
 
-func (m *prometheusMetrics) EventDropped(name string, reason string) {
-    m.dropped.WithLabelValues(name, reason).Inc()
-}
+```go
+import "github.com/shuldan/events/transport/memory"
 
-func (m *prometheusMetrics) QueueDepth(depth int) {
-    m.queueDepth.Set(float64(depth))
-}
-
-bus := events.New(events.WithMetrics(&prometheusMetrics{...}))
+// In-memory транспорт для тестов.
+d := events.New(
+    events.WithTransport(memory.New()),
+    events.WithCodec(codec.NewJSON()),
+)
 ```
 
 ---
@@ -486,77 +496,90 @@ bus := events.New(events.WithMetrics(&prometheusMetrics{...}))
 Метод `Close` принимает контекст для ограничения времени ожидания:
 
 ```go
-// Ожидание до 10 секунд завершения всех обработчиков.
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
 
-if err := bus.Close(ctx); err != nil {
-    slog.Error("shutdown timed out, some events may be lost", "error", err)
+if err := d.Close(ctx); err != nil {
+    slog.Error("shutdown timed out", "error", err)
 }
 ```
 
 При вызове `Close`:
-1. Новые вызовы `Publish` возвращают `ErrPublishOnClosedBus`.
-2. Каналы закрываются, воркеры дообрабатывают оставшиеся задачи.
-3. Если контекст истекает раньше — возвращается `ErrShutdownTimeout`.
+1. Новые вызовы `Publish` возвращают `ErrDispatcherClosed`.
+2. В async-режиме дожидается завершения всех in-flight обработчиков.
+3. Останавливает приём из транспорта.
+4. Закрывает транспорт.
+5. Если контекст истекает раньше — возвращается ошибка контекста.
+
+---
+
+## Структура пакета
+
+```
+events/
+├── dispatcher.go          # Dispatcher, New, Publish, PublishAll, Close
+├── handler.go             # Handler[E], HandleFunc
+├── subscribe.go           # Subscribe[E], Subscription
+├── middleware.go           # Next, Middleware, buildChain
+├── transport.go           # Transport, TransportHandler, Envelope
+├── codec.go               # Codec
+├── event.go               # Event, KeyedEvent
+├── options.go             # Option (глобальные опции Dispatcher)
+├── subscribe_options.go   # SubscribeOption (опции подписки)
+├── retry.go               # RetryPolicy
+├── errors.go              # ErrDispatcherClosed, ErrNilHandler
+│
+├── middleware/             # Готовые middleware
+│   ├── logging.go         # NewLogging
+│   ├── recovery.go        # NewRecovery
+│   └── metrics.go         # NewMetrics
+│
+├── codec/                 # Готовые кодеки
+│   └── json.go            # NewJSON
+│
+└── transport/             # Готовые транспорты
+    └── memory/
+        └── memory.go      # New (in-memory, для тестов)
+```
+
+Тяжёлые зависимости (kafka-client, nats-client, prometheus) изолированы в подпакетах. Корневой пакет — нулевые внешние зависимости.
 
 ---
 
 ## Тестирование
 
-Интерфейсы `Publisher`, `Subscriber` и `EventBus` позволяют подменять шину в тестах:
+Для тестов удобно использовать синхронный режим:
 
 ```go
-type mockPublisher struct {
-    published []events.Event
-}
-
-func (m *mockPublisher) Publish(_ context.Context, event events.Event) error {
-    m.published = append(m.published, event)
-    return nil
-}
-
-func (m *mockPublisher) PublishAll(_ context.Context, evts ...events.Event) error {
-    m.published = append(m.published, evts...)
-    return nil
-}
-
-func TestShipOrder(t *testing.T) {
-    mock := &mockPublisher{}
-    emitter := NewOrderEventEmitter(mock)
-
-    emitter.EmitShipped(context.Background(), "order-1", "TRACK-123")
-
-    if len(mock.published) != 1 {
-        t.Fatalf("expected 1 event, got %d", len(mock.published))
-    }
-    if mock.published[0].EventName() != "order.shipped" {
-        t.Fatalf("unexpected event: %s", mock.published[0].EventName())
-    }
-}
-```
-
-Для интеграционных тестов удобно использовать синхронный режим:
-
-```go
-func TestIntegration(t *testing.T) {
-    bus := events.New(events.WithSyncMode())
-    defer bus.Close(context.Background())
+func TestOrderCreatedHandling(t *testing.T) {
+    d := events.New()
+    defer d.Close(context.Background())
 
     var handled bool
-    events.SubscribeFunc(bus, func(ctx context.Context, e OrderShipped) error {
-        handled = true
-        return nil
-    })
+    h := &testHandler{onHandle: func() { handled = true }}
+    events.Subscribe(d, h)
 
-    _ = bus.Publish(context.Background(), OrderShipped{
-        BaseEvent: events.NewBaseEvent("order.shipped", "order-1"),
-        OrderID:   "order-1",
-    })
+    d.Publish(context.Background(), OrderCreated{OrderID: "order-1"})
 
     if !handled {
         t.Fatal("event was not handled")
     }
+}
+```
+
+In-memory транспорт для интеграционных тестов:
+
+```go
+import "github.com/shuldan/events/transport/memory"
+
+func TestCrossServiceDelivery(t *testing.T) {
+    tr := memory.New()
+    d := events.New(
+        events.WithTransport(tr),
+        events.WithCodec(codec.NewJSON()),
+    )
+    defer d.Close(context.Background())
+    // ...
 }
 ```
 
@@ -568,69 +591,49 @@ func TestIntegration(t *testing.T) {
 
 | Функция / Метод | Описание |
 |---|---|
-| `events.New(opts ...Option) *Dispatcher` | Создаёт диспетчер с заданными опциями |
-| `bus.Close(ctx context.Context) error` | Graceful shutdown с таймаутом через контекст |
+| `events.New(opts ...Option) *Dispatcher` | Создаёт диспетчер |
+| `d.Publish(ctx, event) error` | Публикация одного события |
+| `d.PublishAll(ctx, events...) error` | Публикация нескольких событий |
+| `d.Close(ctx) error` | Graceful shutdown |
 
 ### Подписка
 
 | Функция / Метод | Описание |
 |---|---|
-| `events.Subscribe[T](bus, handler, opts...) Subscription` | Структурный обработчик (`Handler[T]`) |
-| `events.SubscribeFunc[T](bus, fn, opts...) Subscription` | Функциональный обработчик |
-| `bus.SubscribeAll(handler, opts...) Subscription` | Wildcard — все события |
+| `events.Subscribe[E](d, handler, opts...) Subscription` | Типизированная подписка |
 | `sub.Unsubscribe()` | Отмена подписки |
-
-### Публикация
-
-| Метод | Описание |
-|---|---|
-| `bus.Publish(ctx, event) error` | Публикация одного события |
-| `bus.PublishAll(ctx, events...) error` | Публикация нескольких событий |
 
 ### Опции диспетчера
 
 | Опция | Описание | По умолчанию |
 |---|---|---|
-| `WithAsyncMode()` | Асинхронная обработка через пул воркеров | Включено |
-| `WithSyncMode()` | Синхронная обработка в горутине вызывающего | — |
-| `WithWorkerCount(n)` | Количество воркеров | `runtime.NumCPU()` |
-| `WithBufferSize(n)` | Размер буфера канала событий | `workerCount * 10` |
-| `WithPublishTimeout(d)` | Таймаут отправки события в канал | `5s` |
-| `WithOrderedDelivery()` | Упорядоченная доставка по `AggregateID` | Выключено |
+| `WithAsyncMode()` | Асинхронная обработка | Выключено (sync) |
+| `WithWorkerPool(n)` | Количество воркеров | `1` |
+| `WithErrorHandler(fn)` | Обработчик ошибок | `nil` |
 | `WithMiddleware(mw...)` | Глобальные middleware | — |
-| `WithPanicHandler(h)` | Обработчик паник | Логирование в `slog` |
-| `WithErrorHandler(h)` | Обработчик ошибок | Логирование в `slog` |
-| `WithMetrics(m)` | Сборщик метрик | No-op |
+| `WithTransport(t)` | Внешний транспорт | `nil` |
+| `WithCodec(c)` | Кодек сериализации | `nil` |
+| `WithDefaultSubscribeOptions(opts...)` | Дефолтные опции подписок | — |
 
 ### Опции подписки
 
 | Опция | Описание |
 |---|---|
-| `WithRetry(RetryPolicy{...})` | Retry с exponential backoff для подписки |
+| `WithRetry(RetryPolicy{...})` | Retry с exponential backoff |
+| `WithTimeout(d)` | Таймаут обработки события |
+| `WithSubscribeMiddleware(mw...)` | Middleware для конкретной подписки |
 
----
+### Интерфейсы
 
-## Работа с проектом
-
-### Установка инструментов
-
-```sh
-make install-tools
-```
-
-### Полная локальная проверка
-
-```sh
-make all
-```
-
-Выполняет: проверку форматирования, линтинг, security-сканирование, запуск тестов.
-
-### CI
-
-```sh
-make ci
-```
+| Интерфейс | Метод | Назначение |
+|---|---|---|
+| `Handler[E]` | `Handle(ctx, E) error` | Обработчик события |
+| `Middleware` | `Wrap(Next) Next` | Обёртка обработки |
+| `Next` | `Handle(ctx, Event) error` | Следующий элемент цепочки |
+| `Transport` | `Publish / Subscribe / Close` | Внешний транспорт |
+| `TransportHandler` | `Handle(ctx, Envelope) error` | Обработчик входящих сообщений |
+| `Codec` | `Encode / Decode / ContentType` | Сериализация |
+| `KeyedEvent` | `EventKey() string` | Ключ для упорядоченной доставки |
 
 ---
 
@@ -642,7 +645,7 @@ make ci
 
 ## Вклад в проект
 
-PR и issue приветствуются. Перед отправкой убедитесь, что `make all` проходит без ошибок.
+PR и issue приветствуются.
 
 ---
 
