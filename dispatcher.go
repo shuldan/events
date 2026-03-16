@@ -87,6 +87,7 @@ func (d *Dispatcher) startTransportConsumer() {
 	d.transportWg.Add(1)
 	go func() {
 		defer d.transportWg.Done()
+		defer cancel()
 		_ = d.config.transport.Subscribe(ctx, &inboundRouter{dispatcher: d})
 	}()
 }
