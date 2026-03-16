@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"reflect"
+	"time"
 )
 
 type Subscription interface {
@@ -10,70 +11,96 @@ type Subscription interface {
 }
 
 type subscription struct {
+	eventType  reflect.Type
+	next       Next // итоговая цепочка
 	dispatcher *Dispatcher
-	listener   *listener
 }
 
 func (s *subscription) Unsubscribe() {
-	s.dispatcher.removeListener(s.listener)
+	s.dispatcher.unsubscribe(s)
 }
 
-func Subscribe[T Event](d *Dispatcher, handler Handler[T], opts ...SubscribeOption) Subscription {
-	return subscribe[T](d, handler.Handle, opts...)
+// handlerAdapter — адаптер из Handler[E] в Next.
+type handlerAdapter[E Event] struct {
+	handler Handler[E]
 }
 
-func SubscribeFunc[T Event](d *Dispatcher, fn func(context.Context, T) error, opts ...SubscribeOption) Subscription {
-	return subscribe[T](d, fn, opts...)
+func (a *handlerAdapter[E]) Handle(ctx context.Context, event Event) error {
+	typed, ok := event.(E)
+	if !ok {
+		return nil
+	}
+	return a.handler.Handle(ctx, typed)
 }
 
-func subscribe[T Event](d *Dispatcher, fn func(context.Context, T) error, opts ...SubscribeOption) Subscription {
-	eventType := reflect.TypeOf((*T)(nil)).Elem()
-	if eventType.Kind() == reflect.Ptr {
-		eventType = eventType.Elem()
+// retryNext — обёртка retry вокруг Next.
+type retryNext struct {
+	policy RetryPolicy
+	next   Next
+}
+
+func (r *retryNext) Handle(ctx context.Context, event Event) error {
+	return retry(ctx, r.policy, func(ctx context.Context) error {
+		return r.next.Handle(ctx, event)
+	})
+}
+
+// timeoutNext — обёртка timeout вокруг Next.
+type timeoutNext struct {
+	timeout time.Duration
+	next    Next
+}
+
+func (t *timeoutNext) Handle(ctx context.Context, event Event) error {
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	return t.next.Handle(ctx, event)
+}
+
+// Subscribe регистрирует типизированный обработчик.
+func Subscribe[E Event](d *Dispatcher, handler Handler[E], opts ...SubscribeOption) Subscription {
+	if handler == nil {
+		panic(ErrNilHandler)
 	}
 
-	subOpts := defaultSubscribeOptions()
+	eventType := reflect.TypeFor[E]()
+
+	// Мержим опции.
+	cfg := defaultSubscribeConfig()
+	for _, opt := range d.config.defaultSubOpts {
+		opt(&cfg)
+	}
 	for _, opt := range opts {
-		opt(subOpts)
+		opt(&cfg)
 	}
 
-	wrappedHandler := func(ctx context.Context, event Event) error {
-		typed, ok := event.(T)
-		if !ok {
-			return ErrEventTypeMismatch
-		}
-		return fn(ctx, typed)
+	// Базовый обработчик.
+	var base Next = &handlerAdapter[E]{handler: handler}
+
+	// Retry.
+	if cfg.retry != nil {
+		base = &retryNext{policy: *cfg.retry, next: base}
 	}
 
-	finalHandler := buildChain(wrappedHandler, d.opts.middlewares)
-
-	l := &listener{
-		id:        generateID(),
-		eventType: eventType,
-		handler:   finalHandler,
-		retry:     subOpts.retry,
+	// Timeout (оборачивает retry — таймаут на всю попытку с ретраями).
+	if cfg.timeout > 0 {
+		base = &timeoutNext{timeout: cfg.timeout, next: base}
 	}
 
-	d.addListener(eventType, l)
+	// Middleware: global → per-subscriber → handler.
+	allMiddleware := make([]Middleware, 0, len(d.config.middleware)+len(cfg.middleware))
+	allMiddleware = append(allMiddleware, d.config.middleware...)
+	allMiddleware = append(allMiddleware, cfg.middleware...)
 
-	return &subscription{dispatcher: d, listener: l}
-}
+	chain := buildChain(allMiddleware, base)
 
-func (d *Dispatcher) SubscribeAll(handler HandleFunc, opts ...SubscribeOption) Subscription {
-	subOpts := defaultSubscribeOptions()
-	for _, opt := range opts {
-		opt(subOpts)
+	sub := &subscription{
+		eventType:  eventType,
+		next:       chain,
+		dispatcher: d,
 	}
 
-	finalHandler := buildChain(handler, d.opts.middlewares)
+	d.subscribe(sub)
 
-	l := &listener{
-		id:      generateID(),
-		handler: finalHandler,
-		retry:   subOpts.retry,
-	}
-
-	d.addGlobalListener(l)
-
-	return &subscription{dispatcher: d, listener: l}
+	return sub
 }
