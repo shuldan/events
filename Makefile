@@ -81,8 +81,6 @@ test:
 test-coverage:
 	@echo "Running tests with coverage..."
 	@go test ./... -coverprofile=coverage.out -covermode=atomic
-	@go tool cover -html=coverage.out -o coverage.html
-	@echo "Coverage report: coverage.html"
 	@go tool cover -func=coverage.out
 
 # bench: бенчмарки

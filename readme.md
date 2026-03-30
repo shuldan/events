@@ -32,6 +32,12 @@
 go get github.com/shuldan/events
 ```
 
+Для Kafka-транспорта:
+
+```sh
+go get github.com/shuldan/events/transport/kafka
+```
+
 ---
 
 ## Быстрый старт
@@ -234,9 +240,10 @@ d := events.New(
         middleware.NewLogging(slog.Default()),
     ),
     events.WithCodec(codec.NewJSON()),
-    events.WithTransport(kafka.New(kafka.Config{
-        Brokers: []string{"localhost:9092"},
-        Topic:   "domain-events",
+    events.WithTransport(kafkatransport.New(kafkatransport.Config{
+        Brokers:       []string{"localhost:9092"},
+        Topic:         "domain-events",
+        ConsumerGroup: "orders-service",
     })),
     events.WithDefaultSubscribeOptions(
         events.WithRetry(events.RetryPolicy{
@@ -479,15 +486,93 @@ d := events.New(
 
 ### Готовые транспорты
 
+#### In-memory (для тестов)
+
 ```go
 import "github.com/shuldan/events/transport/memory"
 
-// In-memory транспорт для тестов.
 d := events.New(
     events.WithTransport(memory.New()),
     events.WithCodec(codec.NewJSON()),
 )
 ```
+
+#### Kafka
+
+```go
+import kafkatransport "github.com/shuldan/events/transport/kafka"
+
+tr, err := kafkatransport.New(kafkatransport.Config{
+    Brokers:       []string{"localhost:9092"},
+    Topic:         "domain-events",
+    ConsumerGroup: "orders-service",
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+d := events.New(
+    events.WithTransport(tr),
+    events.WithCodec(codec.NewJSON()),
+)
+defer d.Close(context.Background())
+```
+
+#### Конфигурация Kafka-транспорта
+
+| Параметр | Описание | По умолчанию |
+|---|---|---|
+| `Brokers` | Адреса Kafka-брокеров | обязателен |
+| `Topic` | Топик для событий | обязателен |
+| `ConsumerGroup` | Consumer group подписчика | обязателен для Subscribe |
+| `AutoCreateTopics` | Автоматическое создание топика | `false` |
+| `NumPartitions` | Количество партиций (при автосоздании) | `1` |
+| `ReplicationFactor` | Фактор репликации (при автосоздании) | `1` |
+| `MaxBytes` | Максимальный размер batch consumer'а | `1MB` |
+| `CommitInterval` | Интервал коммита offset'ов | `0` (синхронный) |
+| `WriteTimeout` | Таймаут записи producer'а | `10s` |
+
+#### Топология
+
+Kafka-транспорт использует один топик на сервис-источник. Каждый сервис-подписчик использует свою consumer group, что обеспечивает доставку каждого события всем подписчикам:
+
+```
+                          ┌─── orders-service (group: "orders") ──► Handler
+                          │
+Producer ──► [topic] ─────┤
+                          │
+                          └─── analytics-service (group: "analytics") ──► Handler
+```
+
+#### Упорядоченная доставка в Kafka
+
+События с `EventKey()` используют ключ как Kafka message key. Сообщения с одинаковым ключом попадают в одну партицию, что гарантирует порядок обработки:
+
+```go
+type OrderStatusChanged struct {
+    OrderID   string
+    NewStatus string
+}
+
+func (e OrderStatusChanged) EventKey() string { return e.OrderID }
+// Все события заказа "order-123" — в одной партиции, обрабатываются по порядку.
+```
+
+#### Автосоздание топиков
+
+По умолчанию выключено. Если топик не существует — транспорт вернёт ошибку при создании. Для dev-окружения можно включить:
+
+```go
+tr, err := kafkatransport.New(kafkatransport.Config{
+    Brokers:          []string{"localhost:9092"},
+    Topic:            "domain-events",
+    AutoCreateTopics: true,
+    NumPartitions:    3,
+    ReplicationFactor: 1,
+})
+```
+
+В production рекомендуется создавать топики через IaC (Terraform, Helm).
 
 ---
 
@@ -518,7 +603,7 @@ if err := d.Close(ctx); err != nil {
 ```
 events/
 ├── dispatcher.go          # Dispatcher, New, Publish, PublishAll, Close
-├── handler.go             # Handler[E], HandleFunc
+├── handler.go             # Handler[E]
 ├── subscribe.go           # Subscribe[E], Subscription
 ├── middleware.go           # Next, Middleware, buildChain
 ├── transport.go           # Transport, TransportHandler, Envelope
@@ -538,11 +623,17 @@ events/
 │   └── json.go            # NewJSON
 │
 └── transport/             # Готовые транспорты
-    └── memory/
-        └── memory.go      # New (in-memory, для тестов)
+    ├── memory/
+    │   └── memory.go      # New (in-memory, для тестов)
+    └── kafka/
+        ├── config.go      # Config
+        ├── transport.go   # New, Publish, Subscribe, Close
+        ├── headers.go     # Envelope ↔ Kafka Message маппинг
+        ├── writer.go      # messageWriter, messageReader интерфейсы
+        └── errors.go      # ErrTopicNotFound, ErrMissingBrokers, ...
 ```
 
-Тяжёлые зависимости (kafka-client, nats-client, prometheus) изолированы в подпакетах. Корневой пакет — нулевые внешние зависимости.
+Тяжёлые зависимости (`segmentio/kafka-go`) изолированы в подпакетах. Корневой пакет — нулевые внешние зависимости.
 
 ---
 
